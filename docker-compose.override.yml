@@ -1,0 +1,27 @@
+services:
+  api:
+    read_only: false
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--no-access-log"]
+    environment:
+      ENVIRONMENT: development
+      DEV_AUTH_ENABLED: ${DEV_AUTH_ENABLED:-false}
+    volumes:
+      - ./backend:/app
+
+  web:
+    read_only: false
+    build:
+      context: ./frontend
+      target: deps
+    image: catalog-web-dev:latest
+    command: ["npm", "run", "dev"]
+    environment:
+      NODE_ENV: development
+      WATCHPACK_POLLING: "true"
+      NEXT_PUBLIC_DEV_AUTH_TELEGRAM_ID: ${DEV_AUTH_TELEGRAM_ID:-}
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    healthcheck:
+      start_period: 60s

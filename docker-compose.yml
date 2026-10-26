@@ -1,0 +1,209 @@
+name: catalog
+
+x-hardened: &hardened
+  restart: unless-stopped
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
+x-minio-image: &minio-image cgr.dev/chainguard/minio@sha256:d88920d6a50bd0b088223b688be3b76c63e6205dbe494437f67ba1240ea12880
+
+x-database-env: &database-env
+  DB_HOST: postgres
+  DB_PORT: "5432"
+  DB_NAME: ${POSTGRES_DB:-catalog}
+  DB_USER: ${DB_USER:-catalog_app}
+  DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+
+x-telegram-env: &telegram-env
+  TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN in .env}
+  ADMIN_TELEGRAM_IDS: ${ADMIN_TELEGRAM_IDS:-}
+  BOT_API_TOKEN: ${BOT_API_TOKEN:?Set BOT_API_TOKEN in .env}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-catalog}
+      POSTGRES_USER: ${MIGRATION_DB_USER:-catalog_owner}
+      POSTGRES_PASSWORD: ${MIGRATION_DB_PASSWORD:?Set MIGRATION_DB_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    shm_size: 256mb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: *minio-image
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env}
+      MINIO_BROWSER_REDIRECT: "false"
+      MC_CONFIG_DIR: /tmp/.mc
+    volumes:
+      - minio_data:/data
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio-init:
+    image: *minio-image
+    restart: "no"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      minio:
+        condition: service_healthy
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    environment:
+      MC_CONFIG_DIR: /tmp/.mc
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: ${MINIO_BUCKET:-product-images}
+      MINIO_APP_ACCESS_KEY: ${MINIO_APP_ACCESS_KEY:?Set MINIO_APP_ACCESS_KEY in .env}
+      MINIO_APP_SECRET_KEY: ${MINIO_APP_SECRET_KEY:?Set MINIO_APP_SECRET_KEY in .env}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null
+        mc mb --ignore-existing "local/$$MINIO_BUCKET"
+        mc anonymous set none "local/$$MINIO_BUCKET"
+        cat > /tmp/catalog-app.json <<EOF
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {"Effect": "Allow", "Action": ["s3:GetBucketLocation", "s3:ListBucket"], "Resource": ["arn:aws:s3:::$$MINIO_BUCKET"]},
+            {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"], "Resource": ["arn:aws:s3:::$$MINIO_BUCKET/*"]}
+          ]
+        }
+        EOF
+        mc admin policy create local catalog-app /tmp/catalog-app.json
+        mc admin user add local "$$MINIO_APP_ACCESS_KEY" "$$MINIO_APP_SECRET_KEY"
+        mc admin policy attach local catalog-app --user "$$MINIO_APP_ACCESS_KEY" 2>/dev/null || true
+        echo "bucket and application user are ready"
+
+  migrate:
+    <<: *hardened
+    build:
+      context: ./backend
+      target: runtime
+    image: catalog-backend:latest
+    restart: "no"
+    command: ["python", "-m", "app.migrate"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *database-env
+      MIGRATION_DB_USER: ${MIGRATION_DB_USER:-catalog_owner}
+      MIGRATION_DB_PASSWORD: ${MIGRATION_DB_PASSWORD}
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+
+  api:
+    <<: *hardened
+    image: catalog-backend:latest
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      <<: [*database-env, *telegram-env]
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      DEV_AUTH_ENABLED: ${DEV_AUTH_ENABLED:-false}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_SECURE: "false"
+      MINIO_PUBLIC_ENDPOINT: ${PUBLIC_HOST:-localhost:8080}
+      MINIO_PUBLIC_SECURE: ${PUBLIC_HTTPS:-false}
+      MINIO_ACCESS_KEY: ${MINIO_APP_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_APP_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET:-product-images}
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  bot:
+    <<: *hardened
+    build: ./bot
+    image: catalog-bot:latest
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      <<: *telegram-env
+      API_URL: http://api:8000
+      WEBAPP_URL: ${WEBAPP_URL:-http://localhost:8080}
+      WEBHOOK_BASE_URL: ${WEBHOOK_BASE_URL:-}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+
+  web:
+    <<: *hardened
+    build:
+      context: ./frontend
+      target: runner
+    image: catalog-web:latest
+    depends_on:
+      api:
+        condition: service_healthy
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  proxy:
+    <<: *hardened
+    build: ./proxy
+    image: catalog-proxy:latest
+    cap_add: [NET_BIND_SERVICE]
+    depends_on:
+      web:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+      MINIO_BUCKET: ${MINIO_BUCKET:-product-images}
+    ports:
+      - "${HTTP_PORT:-8080}:80"
+      - "${HTTPS_PORT:-8443}:443"
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+
+volumes:
+  postgres_data:
+  minio_data:
+  caddy_data:
+  caddy_config:
